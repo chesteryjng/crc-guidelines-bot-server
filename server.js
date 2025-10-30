@@ -10,6 +10,7 @@ import francPkg from "franc-min";
 const franc = francPkg.franc || francPkg;
 
 import { extractDocx } from "./parsers/extractDocx.js";
+import { ocrImage } from "./parsers/ocrImage.js";
 import { buildIndex, searchTop } from "./search/bm25.js";
 
 // ------------------ Setup ------------------
@@ -24,7 +25,7 @@ const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin";
 const LLM_API_URL = process.env.LLM_API_URL || "";
 const LLM_API_KEY = process.env.LLM_API_KEY || "";
 
-// Resolve paths
+// Resolve paths for storage
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
@@ -32,7 +33,7 @@ const storageDir = path.join(__dirname, "storage");
 const idxPath = path.join(storageDir, "index.json");
 const bmPath = path.join(storageDir, "bm25.json");
 
-// Ensure storage exists
+// Ensure storage folder exists
 if (!fs.existsSync(storageDir)) {
   fs.mkdirSync(storageDir, { recursive: true });
 }
@@ -51,7 +52,6 @@ if (!fs.existsSync(bmPath)) {
 
 // ------------------ Helpers ------------------
 
-// Load current index.json
 function loadIndex() {
   try {
     return JSON.parse(fs.readFileSync(idxPath, "utf8"));
@@ -60,18 +60,16 @@ function loadIndex() {
   }
 }
 
-// Save updated index.json
 function saveIndex(indexObj) {
   fs.writeFileSync(idxPath, JSON.stringify(indexObj, null, 2), "utf8");
 }
 
-// Rebuild BM25 model anytime index changes
 function rebuildBm25AndSave(chunksArray) {
   const model = buildIndex(chunksArray);
   fs.writeFileSync(bmPath, JSON.stringify(model), "utf8");
 }
 
-// Extract text from PDFs (no OCR, just embedded text layer)
+// Extract text from PDFs (embedded text layer only, no PDF OCR yet)
 async function extractFromPdf(pdfPath) {
   const dataBuffer = fs.readFileSync(pdfPath);
   const parsed = await pdfParse(dataBuffer).catch(() => null);
@@ -79,8 +77,9 @@ async function extractFromPdf(pdfPath) {
   return parsed.text.trim();
 }
 
-// Chunk long text into smaller passages
+// Chunk text into ~800 char passages
 function chunkTextToPassages(text, sourceId, maxLen = 800) {
+  // naive whitespace chunker. works ok for English; Chinese becomes long runs
   const clean = text.replace(/\s+/g, " ").trim();
   const words = clean.split(" ");
   const out = [];
@@ -102,6 +101,28 @@ function chunkTextToPassages(text, sourceId, maxLen = 800) {
   }));
 }
 
+// --------------- Rebuild BM25 on boot ---------------
+//
+// This ensures that after a fresh deploy, bm25.json matches index.json.
+// (Prevents stale ranking / "no hits" issues if code changed between uploads.)
+
+(function forceBm25RebuildOnBoot() {
+  try {
+    const idx = loadIndex();
+    const model = buildIndex(idx.chunks || []);
+    fs.writeFileSync(bmPath, JSON.stringify(model), "utf8");
+    console.log("[BOOT] BM25 rebuilt from current index.json");
+    console.log(
+      "[BOOT] docs:",
+      (idx.docs || []).length,
+      "chunks:",
+      (idx.chunks || []).length
+    );
+  } catch (err) {
+    console.error("[BOOT] Failed to rebuild BM25 on startup:", err);
+  }
+})();
+
 // ------------------ Healthcheck ------------------
 
 app.get("/api/health", (req, res) => {
@@ -114,11 +135,8 @@ app.get("/api/health", (req, res) => {
 
 // ------------------ Multer config ------------------
 //
-// We want to accept file uploads from the admin UI, but we’ve seen
-// that sometimes the <input name="..."> differs ("docFile", "file", "document").
-// We'll allow multiple names.
-//
-// We'll store files in /storage with random UUID names.
+// The admin upload form might send "docFile" OR "file" OR "document".
+// We accept all, store them in /storage with a UUID filename.
 
 const multiFieldUpload = multer({
   storage: multer.diskStorage({
@@ -136,34 +154,38 @@ const multiFieldUpload = multer({
   { name: "document", maxCount: 1 },
 ]);
 
-// ------------------ Admin: Upload Guideline ------------------
+// ------------------ Upload Guideline ------------------
 //
 // POST /api/upload
-// Form fields expected from admin page:
-//   title: string
-//   langs: string (e.g. "eng" or "eng,chi_sim")
-//   docFile/file/document: uploaded .pdf or .docx
+// Body (multipart/form-data):
+//   - title (string, required)
+//   - langs (OCR languages, e.g. "eng,chi_sim")
+//   - docFile/file/document: PDF, DOCX, PNG, JPG, JPEG, TIF, TIFF
 //
 // Steps:
-// 1. Save file
-// 2. Extract text (PDF or DOCX only in this version)
-// 3. Chunk text
-// 4. Append to index.json
-// 5. Rebuild bm25.json
+//   1. Save file
+//   2. Extract text
+//   3. Chunk text
+//   4. Append to index.json
+//   5. Rebuild bm25.json
+//
+// NOTE: PDF OCR is still not implemented. We only extract the embedded text.
+// For scanned PDFs, you currently get "empty text" and we fail the upload.
 
 app.post("/api/upload", (req, res) => {
   multiFieldUpload(req, res, async (err) => {
     try {
       if (err) {
         console.error("MULTER ERROR:", err);
-        return res
-          .status(400)
-          .json({ error: "Upload failed (multer)", detail: String(err) });
+        return res.status(400).json({
+          error: "Upload failed (multer)",
+          detail: String(err),
+        });
       }
 
       const { title, langs } = req.body || {};
 
-      // Which file field did we get?
+      // figure out which file field we got
       const fileInfo =
         (req.files && req.files.docFile && req.files.docFile[0]) ||
         (req.files && req.files.file && req.files.file[0]) ||
@@ -171,9 +193,10 @@ app.post("/api/upload", (req, res) => {
         null;
 
       if (!fileInfo) {
-        return res
-          .status(400)
-          .json({ error: "No file received by server", body: req.body || {} });
+        return res.status(400).json({
+          error: "No file received by server",
+          body: req.body || {},
+        });
       }
 
       if (!title || !title.trim()) {
@@ -185,30 +208,43 @@ app.post("/api/upload", (req, res) => {
       const storedPath = fileInfo.path;
       const ext = path.extname(originalName).toLowerCase();
 
-      // Extract text
       let textContent = "";
+
       if (ext === ".pdf") {
+        // Extract embedded text only.
         textContent = (await extractFromPdf(storedPath)) || "";
       } else if (ext === ".docx") {
         textContent = (await extractDocx(storedPath)) || "";
+      } else if (
+        ext === ".png" ||
+        ext === ".jpg" ||
+        ext === ".jpeg" ||
+        ext === ".tif" ||
+        ext === ".tiff"
+      ) {
+        // OCR for images with Tesseract.js and langs from admin form
+        textContent = (await ocrImage(storedPath, langs)) || "";
       } else {
-        // We disabled OCR for now to keep things stable.
         return res.status(400).json({
-          error: "Unsupported file type for text extraction (only .pdf / .docx now)",
+          error:
+            "Unsupported file type for extraction. Supported: pdf, docx, png, jpg, jpeg, tif, tiff",
           receivedExt: ext,
         });
       }
 
       if (!textContent.trim()) {
+        // This will happen if the PDF is scanned (image-only) and has no text layer,
+        // because we haven't implemented page-by-page PDF OCR yet.
         return res.status(400).json({
-          error: "Could not extract text from file (empty text)",
+          error:
+            "Could not extract text from this file (empty result). If this is a scanned PDF, PDF OCR is not yet implemented.",
         });
       }
 
-      // Chunk up the extracted text into passages
+      // Chunk extracted text
       const passages = chunkTextToPassages(textContent, sourceId);
 
-      // Update index.json
+      // Append to index.json
       const idx = loadIndex();
       idx.docs.push({
         sourceId,
@@ -233,15 +269,17 @@ app.post("/api/upload", (req, res) => {
       });
     } catch (e) {
       console.error("UPLOAD HANDLER ERROR:", e);
-      return res.status(500).json({ error: "Upload failed on server" });
+      return res
+        .status(500)
+        .json({ error: "Upload failed on server", detail: String(e) });
     }
   });
 });
 
-// ------------------ Admin: List current guidelines ------------------
+// ------------------ List Guidelines ------------------
 //
 // GET /api/sources
-// Returns metadata of all uploaded guideline documents.
+// Returns summary of all docs in index.json
 
 app.get("/api/sources", (req, res) => {
   try {
@@ -253,15 +291,15 @@ app.get("/api/sources", (req, res) => {
   }
 });
 
-// ------------------ Admin: Delete a guideline ------------------
+// ------------------ Delete Guideline ------------------
 //
 // DELETE /api/source/:id
-// Header: x-admin-secret: must match ADMIN_SECRET
+// Requires header x-admin-secret: ADMIN_SECRET
 //
 // Steps:
-// 1. Remove doc entry from idx.docs
-// 2. Remove its chunks from idx.chunks
-// 3. Save and rebuild BM25
+// 1. Filter out that sourceId from docs and chunks
+// 2. Save
+// 3. Rebuild bm25.json
 
 app.delete("/api/source/:id", (req, res) => {
   try {
@@ -301,9 +339,10 @@ app.delete("/api/source/:id", (req, res) => {
 // POST /api/deepseek-proxy
 // Body: { prompt, max_tokens?, temperature? }
 //
-// This route calls DeepSeek using your API key, which lives in
-// environment variable LLM_API_KEY. The frontend (and normal
-// clients) never see that key.
+// Purpose:
+//   - The frontend calls THIS route.
+//   - This route calls DeepSeek using LLM_API_KEY.
+//   - The key never leaks to the browser.
 
 app.post("/api/deepseek-proxy", async (req, res) => {
   try {
@@ -318,8 +357,7 @@ app.post("/api/deepseek-proxy", async (req, res) => {
       });
     }
 
-    // The body here assumes DeepSeek is OpenAI-chat compatible.
-    // If DeepSeek uses a different shape, adjust here.
+    // Assuming DeepSeek uses an OpenAI-style Chat Completions API.
     const resp = await fetch(LLM_API_URL, {
       method: "POST",
       headers: {
@@ -347,10 +385,12 @@ app.post("/api/deepseek-proxy", async (req, res) => {
 // POST /api/ask
 // Body: { query: "..." }
 //
-// 1. Retrieve top chunks from BM25.
-// 2. Build a strict prompt that forces answers ONLY from guideline evidence.
-// 3. Send that prompt through /api/deepseek-proxy so your key is hidden.
-// 4. Return DeepSeek's final answer.
+// Steps:
+//   1. Pull top 5 relevant passages from bm25
+//   2. If best score < 0.2, fallback
+//   3. Otherwise, build structured prompt containing those passages
+//   4. Call DeepSeek via /api/deepseek-proxy
+//   5. Return DeepSeek's answer or fallback
 
 app.post("/api/ask", async (req, res) => {
   const fallback =
@@ -362,46 +402,66 @@ app.post("/api/ask", async (req, res) => {
       return res.json({ answer: fallback });
     }
 
-    // Load index
+    // Load index.json
     const idx = loadIndex();
     if (!idx.chunks.length) {
+      console.log("[ASK] No chunks in index.json at all.");
       return res.json({ answer: fallback });
     }
 
-    // Load BM25 model
+    // Load bm25.json
     let bm25Model;
     try {
       bm25Model = JSON.parse(fs.readFileSync(bmPath, "utf8"));
     } catch (err) {
-      console.error("bm25 read error:", err);
+      console.error("[ASK] bm25 read error:", err);
       return res.json({ answer: fallback });
     }
 
     // Retrieve top 5 hits
     const hits = searchTop(bm25Model, query, 5);
-    if (!hits.length || hits[0].score < 0.5) {
+
+    if (!hits.length) {
+      console.log("[ASK] No hits returned for query:", query);
       return res.json({ answer: fallback });
     }
 
-    // Build evidence block with short context + title
+    // Debug logging in server logs
+    console.log("[ASK] Query:", query);
+    console.log("[ASK] Top hits (score, sourceId, snippet):");
+    hits.forEach((h, i) => {
+      console.log(
+        `   #${i + 1} score=${h.score?.toFixed?.(3)} src=${h.sourceId} text=${(h.text || "")
+          .slice(0, 120)
+          .replace(/\s+/g, " ")}...`
+      );
+    });
+
+    // Lowered threshold to 0.2 so it's easier to pass
+    const bestScore = hits[0].score ?? 0;
+    if (bestScore < 0.2) {
+      console.log("[ASK] Best score below threshold:", bestScore);
+      return res.json({ answer: fallback });
+    }
+
+    // Create evidence block
     const evidenceBlock = hits
       .map((hit, i) => {
         const parentDoc = idx.docs.find((d) => d.sourceId === hit.sourceId);
         const title = parentDoc?.title || "Guideline";
-        const snippet = hit.text.replace(/\s+/g, " ").trim();
+        const snippet = (hit.text || "").replace(/\s+/g, " ").trim();
         return `(${i + 1}) [${title}] ${snippet}`;
       })
       .join("\n\n");
 
-    // Build DeepSeek prompt with safety instructions
+    // Prompt for the LLM
     const prompt = `
 You are a colorectal cancer clinical information assistant.
 You MUST follow these rules:
 - Only answer using the "Guideline evidence" below.
 - If the evidence does not clearly answer, reply exactly with:
 "${fallback}"
-- Do not invent or guess treatments, doses, or recommendations
-  that are not explicitly stated.
+- Do not invent or guess treatments, doses, or recommendations that are not explicitly stated.
 
 User question:
 "${query}"
@@ -412,7 +472,7 @@ ${evidenceBlock}
 Provide the best possible answer in clear, clinically responsible language.
 `.trim();
 
-    // Call our internal proxy so DeepSeek key stays hidden
+    // Call DeepSeek via our proxy
     const proxyURL = `${req.protocol}://${req.get("host")}/api/deepseek-proxy`;
     const llmResp = await fetch(proxyURL, {
       method: "POST",
@@ -425,14 +485,13 @@ Provide the best possible answer in clear, clinically responsible language.
     });
 
     if (!llmResp.ok) {
-      console.error("Proxy DeepSeek error:", llmResp.status);
+      console.error("[ASK] Proxy DeepSeek error:", llmResp.status);
       return res.json({ answer: fallback });
     }
 
     const llmData = await llmResp.json().catch(() => null);
 
-    // We assume an OpenAI-style response:
-    // { choices: [ { message: { content: "..." } } ] }
+    // Try OpenAI-style first. If not, try .text, then fallback
     const finalAnswer =
       llmData?.choices?.[0]?.message?.content?.trim?.() ||
       llmData?.text?.trim?.() ||
@@ -440,15 +499,14 @@ Provide the best possible answer in clear, clinically responsible language.
 
     return res.json({ answer: finalAnswer });
   } catch (err) {
-    console.error("ASK ERROR:", err);
+    console.error("[ASK] Unhandled error:", err);
     return res.status(500).json({ answer: fallback });
   }
 });
 
-// ------------------ Start server ------------------
+// ------------------ Start Server ------------------
 
 app.listen(PORT, () => {
   console.log(`Server running on port ${PORT}`);
   console.log(`Storage directory: ${storageDir}`);
 });
-
