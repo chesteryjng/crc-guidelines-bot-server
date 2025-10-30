@@ -22,8 +22,11 @@ app.use(express.json());
 // Environment variables
 const PORT = process.env.PORT || 8080;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin";
+
+// NEW: generic LLM config
 const LLM_API_URL = process.env.LLM_API_URL || "";
 const LLM_API_KEY = process.env.LLM_API_KEY || "";
+const LLM_MODEL = process.env.LLM_MODEL || "";
 
 // Resolve paths for storage
 const __filename = fileURLToPath(import.meta.url);
@@ -69,7 +72,7 @@ function rebuildBm25AndSave(chunksArray) {
   fs.writeFileSync(bmPath, JSON.stringify(model), "utf8");
 }
 
-// Extract text from PDFs (embedded text layer only, no PDF OCR yet)
+// Extract text from PDFs
 async function extractFromPdf(pdfPath) {
   const dataBuffer = fs.readFileSync(pdfPath);
   const parsed = await pdfParse(dataBuffer).catch(() => null);
@@ -103,8 +106,8 @@ function chunkTextToPassages(text, sourceId, maxLen = 800) {
 
 // --------------- Rebuild BM25 on boot ---------------
 //
-// This ensures that after a fresh deploy, bm25.json matches index.json.
-// (Prevents stale ranking / "no hits" issues if code changed between uploads.)
+// This ensures bm25.json always matches index.json after (re)deploy.
+// Prevents stale bm25 from older code versions.
 
 (function forceBm25RebuildOnBoot() {
   try {
@@ -129,14 +132,13 @@ app.get("/api/health", (req, res) => {
   res.json({
     ok: true,
     storageDir,
-    LLM: !!LLM_API_KEY,
+    llmConfigured: !!(LLM_API_URL && LLM_API_KEY && LLM_MODEL),
   });
 });
 
 // ------------------ Multer config ------------------
 //
-// The admin upload form might send "docFile" OR "file" OR "document".
-// We accept all, store them in /storage with a UUID filename.
+// We accept docFile/file/document field names from the admin page, just in case.
 
 const multiFieldUpload = multer({
   storage: multer.diskStorage({
@@ -157,20 +159,10 @@ const multiFieldUpload = multer({
 // ------------------ Upload Guideline ------------------
 //
 // POST /api/upload
-// Body (multipart/form-data):
-//   - title (string, required)
-//   - langs (OCR languages, e.g. "eng,chi_sim")
-//   - docFile/file/document: PDF, DOCX, PNG, JPG, JPEG, TIF, TIFF
+// multipart/form-data: title, langs, docFile/file/document
+// Supports: pdf (text layer only for now), docx, png/jpg/jpeg/tif/tiff (OCR).
 //
-// Steps:
-//   1. Save file
-//   2. Extract text
-//   3. Chunk text
-//   4. Append to index.json
-//   5. Rebuild bm25.json
-//
-// NOTE: PDF OCR is still not implemented. We only extract the embedded text.
-// For scanned PDFs, you currently get "empty text" and we fail the upload.
+// After extraction, we chunk -> append to index.json -> rebuild BM25.
 
 app.post("/api/upload", (req, res) => {
   multiFieldUpload(req, res, async (err) => {
@@ -185,7 +177,6 @@ app.post("/api/upload", (req, res) => {
 
       const { title, langs } = req.body || {};
 
-      // figure out which file field we got
       const fileInfo =
         (req.files && req.files.docFile && req.files.docFile[0]) ||
         (req.files && req.files.file && req.files.file[0]) ||
@@ -211,7 +202,6 @@ app.post("/api/upload", (req, res) => {
       let textContent = "";
 
       if (ext === ".pdf") {
-        // Extract embedded text only.
         textContent = (await extractFromPdf(storedPath)) || "";
       } else if (ext === ".docx") {
         textContent = (await extractDocx(storedPath)) || "";
@@ -222,7 +212,6 @@ app.post("/api/upload", (req, res) => {
         ext === ".tif" ||
         ext === ".tiff"
       ) {
-        // OCR for images with Tesseract.js and langs from admin form
         textContent = (await ocrImage(storedPath, langs)) || "";
       } else {
         return res.status(400).json({
@@ -233,18 +222,16 @@ app.post("/api/upload", (req, res) => {
       }
 
       if (!textContent.trim()) {
-        // This will happen if the PDF is scanned (image-only) and has no text layer,
-        // because we haven't implemented page-by-page PDF OCR yet.
         return res.status(400).json({
           error:
-            "Could not extract text from this file (empty result). If this is a scanned PDF, PDF OCR is not yet implemented.",
+            "Could not extract text from this file (empty result). " +
+            "If this is a scanned PDF, PDF OCR for images inside PDF is not implemented yet.",
         });
       }
 
-      // Chunk extracted text
+      // Chunk and index
       const passages = chunkTextToPassages(textContent, sourceId);
 
-      // Append to index.json
       const idx = loadIndex();
       idx.docs.push({
         sourceId,
@@ -257,7 +244,6 @@ app.post("/api/upload", (req, res) => {
       idx.chunks.push(...passages);
       saveIndex(idx);
 
-      // Rebuild BM25 search index
       rebuildBm25AndSave(idx.chunks);
 
       return res.json({
@@ -279,7 +265,7 @@ app.post("/api/upload", (req, res) => {
 // ------------------ List Guidelines ------------------
 //
 // GET /api/sources
-// Returns summary of all docs in index.json
+// Returns idx.docs for admin dashboard
 
 app.get("/api/sources", (req, res) => {
   try {
@@ -294,12 +280,8 @@ app.get("/api/sources", (req, res) => {
 // ------------------ Delete Guideline ------------------
 //
 // DELETE /api/source/:id
-// Requires header x-admin-secret: ADMIN_SECRET
-//
-// Steps:
-// 1. Filter out that sourceId from docs and chunks
-// 2. Save
-// 3. Rebuild bm25.json
+// Requires header x-admin-secret == ADMIN_SECRET
+// Removes doc & all its chunks, then rebuilds BM25.
 
 app.delete("/api/source/:id", (req, res) => {
   try {
@@ -334,49 +316,71 @@ app.delete("/api/source/:id", (req, res) => {
   }
 });
 
-// ------------------ DeepSeek Proxy ------------------
+// ------------------ Generic LLM Proxy ------------------
 //
-// POST /api/deepseek-proxy
+// POST /api/llm-proxy
 // Body: { prompt, max_tokens?, temperature? }
 //
-// Purpose:
-//   - The frontend calls THIS route.
-//   - This route calls DeepSeek using LLM_API_KEY.
-//   - The key never leaks to the browser.
+// This is an OpenAI-compatible call.
+// We send {model, messages:[{role:"user", content: prompt}], ...} to LLM_API_URL.
+// We hide LLM_API_KEY from the browser/frontend.
 
-app.post("/api/deepseek-proxy", async (req, res) => {
+app.post("/api/llm-proxy", async (req, res) => {
   try {
     const { prompt, max_tokens = 512, temperature = 0.2 } = req.body || {};
     if (!prompt) {
       return res.status(400).json({ error: "Missing prompt" });
     }
 
-    if (!LLM_API_URL || !LLM_API_KEY) {
+    if (!LLM_API_URL || !LLM_API_KEY || !LLM_MODEL) {
+      console.error("[LLM] Missing LLM_API_URL / LLM_API_KEY / LLM_MODEL");
       return res.status(500).json({
-        error: "Server missing DeepSeek credentials",
+        error: "Server LLM config incomplete",
+        have_URL: !!LLM_API_URL,
+        have_KEY: !!LLM_API_KEY,
+        have_MODEL: !!LLM_MODEL,
       });
     }
 
-    // Assuming DeepSeek uses an OpenAI-style Chat Completions API.
-    const resp = await fetch(LLM_API_URL, {
+    const upstreamResp = await fetch(LLM_API_URL, {
       method: "POST",
       headers: {
         Authorization: `Bearer ${LLM_API_KEY}`,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        model: "deepseek-chat",
+        model: LLM_MODEL,
         messages: [{ role: "user", content: prompt }],
         max_tokens,
         temperature,
       }),
     });
 
-    const data = await resp.json().catch(() => null);
-    return res.status(resp.status).json(data);
+    const rawText = await upstreamResp.text();
+    let data = null;
+    try {
+      data = JSON.parse(rawText);
+    } catch {
+      data = { raw: rawText };
+    }
+
+    if (!upstreamResp.ok) {
+      console.error(
+        "[LLM] Upstream error:",
+        upstreamResp.status,
+        JSON.stringify(data).slice(0, 300)
+      );
+      return res.status(upstreamResp.status).json({
+        error: "Upstream LLM request failed",
+        status: upstreamResp.status,
+        data,
+      });
+    }
+
+    return res.status(200).json(data);
   } catch (err) {
-    console.error("DeepSeek proxy error:", err);
-    return res.status(500).json({ error: "Proxy failure" });
+    console.error("[LLM] Proxy failure:", err);
+    return res.status(500).json({ error: "Proxy failure", detail: String(err) });
   }
 });
 
@@ -386,11 +390,11 @@ app.post("/api/deepseek-proxy", async (req, res) => {
 // Body: { query: "..." }
 //
 // Steps:
-//   1. Pull top 5 relevant passages from bm25
-//   2. If best score < 0.2, fallback
-//   3. Otherwise, build structured prompt containing those passages
-//   4. Call DeepSeek via /api/deepseek-proxy
-//   5. Return DeepSeek's answer or fallback
+//   1. Retrieve top 5 BM25 passages
+//   2. If bestScore < 0.2 -> fallback
+//   3. Build strict prompt
+//   4. Send to /api/llm-proxy
+//   5. Return LLM's answer or fallback
 
 app.post("/api/ask", async (req, res) => {
   const fallback =
@@ -418,7 +422,7 @@ app.post("/api/ask", async (req, res) => {
       return res.json({ answer: fallback });
     }
 
-    // Retrieve top 5 hits
+    // Retrieve top hits
     const hits = searchTop(bm25Model, query, 5);
 
     if (!hits.length) {
@@ -426,7 +430,7 @@ app.post("/api/ask", async (req, res) => {
       return res.json({ answer: fallback });
     }
 
-    // Debug logging in server logs
+    // Debug
     console.log("[ASK] Query:", query);
     console.log("[ASK] Top hits (score, sourceId, snippet):");
     hits.forEach((h, i) => {
@@ -437,14 +441,14 @@ app.post("/api/ask", async (req, res) => {
       );
     });
 
-    // Lowered threshold to 0.2 so it's easier to pass
+    // threshold
     const bestScore = hits[0].score ?? 0;
     if (bestScore < 0.2) {
       console.log("[ASK] Best score below threshold:", bestScore);
       return res.json({ answer: fallback });
     }
 
-    // Create evidence block
+    // Build evidence
     const evidenceBlock = hits
       .map((hit, i) => {
         const parentDoc = idx.docs.find((d) => d.sourceId === hit.sourceId);
@@ -454,7 +458,7 @@ app.post("/api/ask", async (req, res) => {
       })
       .join("\n\n");
 
-    // Prompt for the LLM
+    // Prompt for LLM
     const prompt = `
 You are a colorectal cancer clinical information assistant.
 You MUST follow these rules:
@@ -472,8 +476,9 @@ ${evidenceBlock}
 Provide the best possible answer in clear, clinically responsible language.
 `.trim();
 
-    // Call DeepSeek via our proxy
-    const proxyURL = `${req.protocol}://${req.get("host")}/api/deepseek-proxy`;
+    // Call our generic LLM proxy
+    const proxyURL = `${req.protocol}://${req.get("host")}/api/llm-proxy`;
+
     const llmResp = await fetch(proxyURL, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -485,13 +490,13 @@ Provide the best possible answer in clear, clinically responsible language.
     });
 
     if (!llmResp.ok) {
-      console.error("[ASK] Proxy DeepSeek error:", llmResp.status);
+      console.error("[ASK] Proxy LLM error:", llmResp.status);
       return res.json({ answer: fallback });
     }
 
     const llmData = await llmResp.json().catch(() => null);
 
-    // Try OpenAI-style first. If not, try .text, then fallback
+    // Try OpenAI ChatCompletion shape:
     const finalAnswer =
       llmData?.choices?.[0]?.message?.content?.trim?.() ||
       llmData?.text?.trim?.() ||
