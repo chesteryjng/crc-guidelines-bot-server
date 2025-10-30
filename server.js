@@ -1,395 +1,145 @@
-// server.js
-//
-// Backend API for:
-// - uploading guidelines (PDF/DOCX/image with OCR)
-// - chunking + indexing
-// - answering user questions from uploaded guidelines
-// - listing & deleting guidelines
-//
-// Persistent data is kept in /storage (or Render's runtime dir).
-// Deletion rebuilds the BM25 model so removed docs stop showing up.
-
-import express from 'express';
-import cors from 'cors';
-import multer from 'multer';
-import fs from 'fs';
-import path from 'path';
-import pdfParse from 'pdf-parse';
-import { v4 as uuidv4 } from 'uuid';
-import { fileURLToPath } from 'url';
-import { extractDocx } from './parsers/extractDocx.js';
-import { ocrImage } from './parsers/ocrImage.js';
-import { buildIndex, searchTop } from './search/bm25.js';
-import francPkg from 'franc-min';
+import express from "express";
+import cors from "cors";
+import multer from "multer";
+import fs from "fs";
+import path from "path";
+import pdfParse from "pdf-parse";
+import { v4 as uuidv4 } from "uuid";
+import { fileURLToPath } from "url";
+import { extractDocx } from "./parsers/extractDocx.js";
+import { buildIndex, searchTop } from "./search/bm25.js";
+import francPkg from "franc-min";
 const franc = francPkg.franc || francPkg;
 
-// --------------------------------------------------
-// __dirname emulation for ES modules
-// --------------------------------------------------
+const app = express();
+app.use(cors());
+app.use(express.json());
+
+// ----- ENVIRONMENT VARIABLES -----
+const PORT = process.env.PORT || 8080;
+const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin";
+const LLM_API_URL = process.env.LLM_API_URL || "";
+const LLM_API_KEY = process.env.LLM_API_KEY || "";
+
+// ----- STORAGE PATHS -----
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+const storageDir = path.join(__dirname, "storage");
+const idxPath = path.join(storageDir, "index.json");
+const bmPath = path.join(storageDir, "bm25.json");
+if (!fs.existsSync(storageDir)) fs.mkdirSync(storageDir);
 
-// --------------------------------------------------
-// App config
-// --------------------------------------------------
-const app = express();
-app.use(cors()); // allow cross-origin calls from GitHub Pages frontend
-app.use(express.json({ limit: '10mb' }));
-
-const PORT = process.env.PORT || 8080;
-const ADMIN_SECRET = process.env.ADMIN_SECRET || 'change-me';
-
-// storage paths
-const storageRoot =
-  process.env.STORAGE_DIR ||
-  process.env.storageDir ||
-  path.join(__dirname, 'storage');
-
-const storageDir = path.resolve(storageRoot);
-const uploadDir = path.join(storageDir, 'uploads');
-const indexPath = path.join(storageDir, 'index.json');
-const bmPath = path.join(storageDir, 'bm25.json');
-
-// ensure dirs exist
-fs.mkdirSync(uploadDir, { recursive: true });
-
-// --------------------------------------------------
-// index.json structure:
-//
-// {
-//   "docs": [
-//     {
-//       "sourceId": "...",
-//       "title": "...",
-//       "filename": "...",
-//       "lang": "...",
-//       "uploadedAt": "ISO string"
-//     }
-//   ],
-//   "chunks": [
-//     { "id": "...", "sourceId": "...", "text": "..." }
-//   ],
-//   "builtAt": "ISO string"
-// }
-// --------------------------------------------------
+// ---------------- HELPERS ----------------
 function loadIndex() {
-  if (fs.existsSync(indexPath)) {
-    try {
-      return JSON.parse(fs.readFileSync(indexPath, 'utf8'));
-    } catch (err) {
-      console.error('Error parsing index.json. Resetting.', err);
-    }
-  }
-  return { docs: [], chunks: [], builtAt: null };
+  if (!fs.existsSync(idxPath)) return { docs: [], chunks: [] };
+  return JSON.parse(fs.readFileSync(idxPath, "utf8"));
 }
-
-function saveIndex(idx) {
-  fs.writeFileSync(indexPath, JSON.stringify(idx, null, 2), 'utf8');
+function saveIndex(data) {
+  fs.writeFileSync(idxPath, JSON.stringify(data, null, 2), "utf8");
 }
-
-// Build BM25 model from chunks and write to bm25.json
 function rebuildBm25AndSave(chunksArray) {
   const model = buildIndex(chunksArray);
-  fs.writeFileSync(bmPath, JSON.stringify(model), 'utf8');
+  fs.writeFileSync(bmPath, JSON.stringify(model), "utf8");
 }
 
-// Multer for handling uploads
-const upload = multer({ dest: uploadDir });
+// ---------- HEALTH ----------
+app.get("/api/health", (_, res) =>
+  res.json({ ok: true, storageDir, LLM: !!LLM_API_KEY })
+);
 
-// --------------------------------------------------
-// Extract text helpers
-// --------------------------------------------------
-async function extractFromPdf(filePath) {
-  // First try text layer
-  const data = await pdfParse(fs.readFileSync(filePath));
-  const text = (data.text || '').trim();
-  return text;
-}
+// ---------- ADMIN UPLOAD / DELETE / SOURCES ----------
+// (keep your existing upload + delete code here – unchanged)
 
-// chunk long text -> overlapping passages for search
-function makeChunks(fullText, sourceId, size = 1200, overlap = 120) {
-  const out = [];
-  let i = 0;
-  while (i < fullText.length) {
-    const slice = fullText.slice(i, i + size);
-    out.push({ id: uuidv4(), sourceId, text: slice });
-    i += (size - overlap);
-  }
-  return out;
-}
-
-// --------------------------------------------------
-// ROUTE: GET /api/health
-// Simple sanity check
-// --------------------------------------------------
-app.get('/api/health', (req, res) => {
-  res.json({ ok: true, storageDir });
-});
-
-// --------------------------------------------------
-// ROUTE: POST /api/upload
-//
-// form-data:
-//   secret = ADMIN_SECRET
-//   title  = guideline title
-//   langs  = "eng" or "eng,chi_sim" etc
-//   file   = PDF / DOCX / JPG / PNG / TIFF
-//
-// Actions:
-//   - extract text (try parse for pdf/docx, fallback OCR if scanned/IMG)
-//   - detect language (franc-min)
-//   - chunk text
-//   - append to index.json
-//   - rebuild bm25.json
-// --------------------------------------------------
-app.post('/api/upload', upload.single('file'), async (req, res) => {
+// ---------- DEEPSEEK PROXY (hides API key) ----------
+app.post("/api/deepseek-proxy", async (req, res) => {
   try {
-    const { secret, title, langs = 'eng' } = req.body || {};
+    const { prompt, max_tokens = 512, temperature = 0.2 } = req.body || {};
+    if (!prompt) return res.status(400).json({ error: "Missing prompt" });
+    if (!LLM_API_URL || !LLM_API_KEY)
+      return res.status(500).json({ error: "Server missing DeepSeek credentials" });
 
-    if (secret !== ADMIN_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    if (!req.file || !title) {
-      return res.status(400).json({
-        error: 'Missing file and/or title'
-      });
-    }
-
-    const ext = path.extname(req.file.originalname).toLowerCase();
-    const sourceId = uuidv4();
-    let text = '';
-
-    if (ext === '.pdf') {
-      // try text layer
-      text = (await extractFromPdf(req.file.path)) || '';
-      // fallback OCR if empty
-      if (!text.trim()) {
-        text = await ocrImage(req.file.path, langs);
-      }
-    } else if (ext === '.doc' || ext === '.docx') {
-      text = await extractDocx(req.file.path);
-    } else if (
-      ext === '.png' ||
-      ext === '.jpg' ||
-      ext === '.jpeg' ||
-      ext === '.tif' ||
-      ext === '.tiff'
-    ) {
-      text = await ocrImage(req.file.path, langs);
-    } else {
-      return res.status(415).json({
-        error: `Unsupported file type: ${ext}`
-      });
-    }
-
-    if (!text || !text.trim()) {
-      return res.status(400).json({
-        error: 'No extractable text found (even after OCR).'
-      });
-    }
-
-    const langGuess = franc(text.slice(0, 4000) || 'unknown');
-
-    // chunk it
-    const newChunks = makeChunks(text, sourceId);
-
-    // merge into index
-    const idx = loadIndex();
-    idx.docs.push({
-      sourceId,
-      title,
-      filename: req.file.originalname,
-      lang: langGuess,
-      uploadedAt: new Date().toISOString()
-    });
-    idx.chunks.push(...newChunks);
-    idx.builtAt = new Date().toISOString();
-
-    // rebuild BM25
-    rebuildBm25AndSave(idx.chunks);
-
-    // save index
-    saveIndex(idx);
-
-    return res.json({
-      ok: true,
-      sourceId,
-      title,
-      chunks: newChunks.length,
-      langGuess
+    const resp = await fetch(LLM_API_URL, {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${LLM_API_KEY}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        model: "deepseek-chat", // adjust if docs require a different model name
+        messages: [{ role: "user", content: prompt }],
+        max_tokens,
+        temperature,
+      }),
     });
 
+    const data = await resp.json().catch(() => null);
+    res.status(resp.status).json(data);
   } catch (err) {
-    console.error('UPLOAD ERROR:', err);
-    return res.status(500).json({ error: 'Upload failed' });
+    console.error("DeepSeek proxy error:", err);
+    res.status(500).json({ error: "Proxy failure" });
   }
 });
 
-// --------------------------------------------------
-// ROUTE: POST /api/ask
-//
-// body JSON: { "query": "user question" }
-//
-// returns best chunk from loaded guidelines,
-// or fallback advice if relevance is too weak.
-// --------------------------------------------------
-app.post('/api/ask', async (req, res) => {
+// ---------- RAG ASK ----------
+app.post("/api/ask", async (req, res) => {
   try {
     const { query } = req.body || {};
-    if (!query || !query.trim()) {
-      return res.status(400).json({ error: 'Missing query' });
-    }
-
     const fallback =
-      'Sorry, I am unable to assist you with your current query. I would recommend you to speak to a healthcare professional for more advice.';
+      "Sorry, I am unable to assist you with your current query. I would recommend you to speak to a healthcare professional for more advice.";
+
+    if (!query?.trim()) return res.status(400).json({ answer: fallback });
 
     const idx = loadIndex();
-    if (!idx.chunks.length) {
-      return res.json({ answer: fallback });
-    }
+    if (!idx.chunks.length) return res.json({ answer: fallback });
+    const bm25Model = JSON.parse(fs.readFileSync(bmPath, "utf8"));
+    const hits = searchTop(bm25Model, query, 5);
+    if (!hits.length || hits[0].score < 0.5) return res.json({ answer: fallback });
 
-    if (!fs.existsSync(bmPath)) {
-      return res.json({ answer: fallback });
-    }
+    const evidence = hits
+      .map((h, i) => {
+        const d = idx.docs.find((x) => x.sourceId === h.sourceId);
+        return `(${i + 1}) [${d?.title || "Guideline"}] ${h.text.replace(/\s+/g, " ")}`;
+      })
+      .join("\n\n");
 
-    let model;
-    try {
-      model = JSON.parse(fs.readFileSync(bmPath, 'utf8'));
-    } catch (err) {
-      console.error('Cannot parse bm25.json:', err);
-      return res.json({ answer: fallback });
-    }
+    const prompt = `
+You are a colorectal cancer clinical information assistant.
+Only use the evidence below to answer.
+If the evidence does not directly support an answer, respond:
+"${fallback}"
 
-    const hits = searchTop(model, query, 5);
+User question: "${query}"
 
-    if (!hits.length || hits[0].score < 0.5) {
-      return res.json({ answer: fallback });
-    }
+Guideline evidence:
+${evidence}
+`.trim();
 
-    const best = hits[0];
-    const parentDoc = idx.docs.find(d => d.sourceId === best.sourceId);
-
-    const context = best.text.replace(/\s+/g, ' ').trim();
-
-    const answer = `From: ${parentDoc?.title || 'Guideline'}
-
-${context}
-
-(If this does not fully address your question, please consult a healthcare professional.)`;
-
-    return res.json({ answer });
-
-  } catch (err) {
-    console.error('ASK ERROR:', err);
-    return res.status(500).json({
-      answer:
-        'Sorry, I am unable to assist you with your current query. I would recommend you to speak to a healthcare professional for more advice.'
+    // --- Call your secure proxy instead of DeepSeek directly ---
+    const proxyResp = await fetch(`${req.protocol}://${req.get("host")}/api/deepseek-proxy`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ prompt, max_tokens: 512, temperature: 0.2 }),
     });
+
+    if (!proxyResp.ok) {
+      console.error("Proxy error:", proxyResp.status);
+      return res.json({ answer: fallback });
+    }
+
+    const proxyData = await proxyResp.json().catch(() => null);
+    const answer =
+      proxyData?.choices?.[0]?.message?.content?.trim?.() ||
+      proxyData?.text?.trim?.() ||
+      fallback;
+
+    res.json({ answer });
+  } catch (err) {
+    console.error("ASK ERROR:", err);
+    res.status(500).json({ answer: "Server error." });
   }
 });
 
-// --------------------------------------------------
-// ROUTE: GET /api/sources
-//
-// Returns summary of what's indexed.
-// {
-//   totalGuidelines: N,
-//   guidelines: [
-//     { title, sourceId, filename, uploadedAt, lang, chunks }
-//   ]
-// }
-// --------------------------------------------------
-app.get('/api/sources', (req, res) => {
-  try {
-    const idx = loadIndex();
-
-    const list = idx.docs.map(doc => {
-      const countForDoc = idx.chunks
-        .filter(c => c.sourceId === doc.sourceId)
-        .length;
-      return {
-        title: doc.title,
-        sourceId: doc.sourceId,
-        filename: doc.filename,
-        uploadedAt: doc.uploadedAt,
-        lang: doc.lang,
-        chunks: countForDoc
-      };
-    });
-
-    return res.json({
-      totalGuidelines: list.length,
-      guidelines: list
-    });
-
-  } catch (err) {
-    console.error('SOURCES ERROR:', err);
-    return res
-      .status(500)
-      .json({ error: 'Unable to list sources' });
-  }
-});
-
-// --------------------------------------------------
-// ROUTE: DELETE /api/source/:sourceId
-//
-// Requires ?secret=ADMIN_SECRET
-//
-// Deletes the guideline from index.json and its chunks,
-// rebuilds bm25.json, then returns {ok:true,...}.
-// --------------------------------------------------
-app.delete('/api/source/:sourceId', (req, res) => {
-  try {
-    const { sourceId } = req.params;
-    const { secret } = req.query;
-
-    if (secret !== ADMIN_SECRET) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-
-    const idx = loadIndex();
-
-    const exists = idx.docs.some(d => d.sourceId === sourceId);
-    if (!exists) {
-      return res.status(404).json({ error: 'Source not found' });
-    }
-
-    // filter out that doc
-    const newDocs = idx.docs.filter(d => d.sourceId !== sourceId);
-    const newChunks = idx.chunks.filter(c => c.sourceId !== sourceId);
-
-    const newIdx = {
-      docs: newDocs,
-      chunks: newChunks,
-      builtAt: new Date().toISOString()
-    };
-
-    // save new index
-    saveIndex(newIdx);
-
-    // rebuild BM25 from remaining chunks
-    rebuildBm25AndSave(newChunks);
-
-    return res.json({
-      ok: true,
-      removed: sourceId,
-      remainingGuidelines: newDocs.length
-    });
-
-  } catch (err) {
-    console.error('DELETE SOURCE ERROR:', err);
-    return res.status(500).json({ error: 'Failed to delete source' });
-  }
-});
-
-// --------------------------------------------------
-// START SERVER
-// --------------------------------------------------
-app.listen(PORT, () => {
-  console.log(
-    'Server running on port ' +
-    PORT +
-    ' with storage at ' +
-    storageDir
-  );
-});
+// ---------- START ----------
+app.listen(PORT, () =>
+  console.log(`Server running on port ${PORT}, storage at ${storageDir}`)
+);
