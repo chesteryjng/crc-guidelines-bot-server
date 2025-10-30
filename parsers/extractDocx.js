@@ -1,8 +1,14 @@
 import fs from 'fs';
-import { parseDocx } from 'docx-parser';
+import mammoth from 'mammoth';
 
 export async function extractDocx(filePath) {
+  // mammoth extracts text from .docx buffer
   const buffer = fs.readFileSync(filePath);
-  const text = await parseDocx(buffer);
-  return (text || '').trim();
+
+  const result = await mammoth.extractRawText({ buffer });
+  // result.value is the extracted plain text
+  const text = (result && result.value) ? result.value : '';
+
+  return text.trim();
 }
+
