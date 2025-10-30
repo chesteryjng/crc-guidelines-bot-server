@@ -1,76 +1,110 @@
-const k1 = 1.5;
-const b = 0.75;
+// search/bm25.js
+//
+// Minimal BM25-style retrieval over chunked guideline text.
+// We store doc-term frequencies and compute a relevance score
+// for the user's query.
 
-function tokenize(s){
-  return s.toLowerCase()
-    .replace(/[^a-z0-9\u00C0-\u024F\u4E00-\u9FFF]+/g,' ')
-    .split(/\s+/).filter(Boolean);
+function tokenize(str) {
+  // Lowercase, keep alphanumerics + CJK (for Chinese guidelines),
+  // split on anything else.
+  return str
+    .toLowerCase()
+    .replace(/[^a-z0-9\u4e00-\u9fff]+/gi, ' ')
+    .split(/\s+/)
+    .filter(Boolean);
 }
 
-export function buildIndex(chunks){
-  // docs: array of {id, sourceId, text}
-  const docs = chunks.map((c,i) => ({ id:i, sourceId:c.sourceId, text:c.text }));
-  // corpus: token arrays
-  const corpus = docs.map(d => tokenize(d.text));
-  // df: document frequency map
-  const df = new Map();
-  // tf: term freq per doc
-  const tf = corpus.map(tokens => {
-    const map = new Map();
-    tokens.forEach(t => map.set(t, (map.get(t)||0)+1));
-    for (const t of new Set(tokens)) {
-      df.set(t, (df.get(t)||0)+1);
+// Build an index model from chunks:
+// chunks = [ { id, sourceId, text }, ... ]
+export function buildIndex(chunks) {
+  // Each chunk becomes a "doc" in the BM25 sense
+  const docs = chunks.map(ch => {
+    const tokens = tokenize(ch.text);
+    const freq = {};
+    tokens.forEach(t => {
+      freq[t] = (freq[t] || 0) + 1;
+    });
+    return {
+      id: ch.id,
+      sourceId: ch.sourceId,
+      text: ch.text,
+      freq,          // term -> count
+      len: tokens.length
+    };
+  });
+
+  // document frequency per term
+  const df = {};
+  docs.forEach(doc => {
+    for (const term in doc.freq) {
+      df[term] = (df[term] || 0) + 1;
     }
-    return map;
   });
 
   const N = docs.length;
-  const avgdl = corpus.reduce((a,toks)=>a+toks.length,0) / Math.max(1,N);
+  const avgdl = N > 0
+    ? docs.reduce((sum, d) => sum + d.len, 0) / N
+    : 0;
 
-  // convert Maps to plain objects so we can JSON serialize
-  return {
-    docs,
-    df: Object.fromEntries(df),
-    tf: tf.map(m => Object.fromEntries(m)),
-    N,
-    avgdl
-  };
+  return { docs, df, N, avgdl };
 }
 
-export function searchTop(model, query, k=5){
-  const qterms = Array.from(new Set(
-    (query||'').toLowerCase().split(/\s+/).filter(Boolean)
-  ));
+// Query the index using simple BM25
+export function searchTop(model, query, k = 5) {
+  const { docs, df, N, avgdl } = model;
 
-  const results = [];
-
-  for (let i=0;i<model.docs.length;i++){
-    // doc length = sum tf values
-    const tfDoc = model.tf[i];
-    const dl = Object.values(tfDoc).reduce((a,b)=>a+b,0) || 0;
-
-    let score = 0;
-    for (const t of qterms){
-      const ni = model.df[t]||0;
-      if (!ni) continue;
-      // IDF
-      const idf = Math.log( (model.N - ni + 0.5)/(ni + 0.5) + 1 );
-      // term freq in this doc
-      const fii = tfDoc[t]||0;
-      const denom = fii + k1 * (1 - b + b * (dl / (model.avgdl||1)));
-      score += idf * ( (fii * (k1 + 1)) / (denom || 1) );
-    }
-
-    if (score > 0){
-      results.push({
-        id: i,
-        sourceId: model.docs[i].sourceId,
-        score,
-        text: model.docs[i].text
-      });
-    }
+  if (!docs || !docs.length) {
+    return [];
   }
 
-  results.sort((a,b)=>b.score-a.score);
-  return results.slice(0,k);
+  const qTokens = tokenize(query);
+
+  function bm25Score(doc) {
+    // BM25 params
+    const k1 = 1.5;
+    const b = 0.75;
+
+    // accumulate score across query terms
+    let score = 0;
+
+    // for each distinct term in query
+    const seen = new Set();
+    for (const term of qTokens) {
+      if (seen.has(term)) continue;
+      seen.add(term);
+
+      const n_qi = df[term] || 0;
+      if (!n_qi) continue; // no doc has this term at all
+
+      const f_qi = doc.freq[term] || 0;
+      if (!f_qi) continue; // this doc doesn't have this term
+
+      // IDF
+      const idf = Math.log(
+        ( (N - n_qi + 0.5) / (n_qi + 0.5) ) + 1
+      );
+
+      // term frequency scaling
+      const denom =
+        f_qi +
+        k1 * (1 - b + b * (doc.len / (avgdl || 1)));
+
+      score += idf * ( (f_qi * (k1 + 1)) / denom );
+    }
+
+    return score;
+  }
+
+  // score all docs
+  const scored = docs.map(doc => ({
+    sourceId: doc.sourceId,
+    text: doc.text,
+    score: bm25Score(doc)
+  }));
+
+  // sort high → low
+  scored.sort((a, b) => b.score - a.score);
+
+  // return top k
+  return scored.slice(0, k);
 }
