@@ -23,7 +23,7 @@ app.use(express.json());
 const PORT = process.env.PORT || 8080;
 const ADMIN_SECRET = process.env.ADMIN_SECRET || "admin";
 
-// NEW: generic LLM config
+// Generic LLM config (provider-agnostic)
 const LLM_API_URL = process.env.LLM_API_URL || "";
 const LLM_API_KEY = process.env.LLM_API_KEY || "";
 const LLM_MODEL = process.env.LLM_MODEL || "";
@@ -72,7 +72,7 @@ function rebuildBm25AndSave(chunksArray) {
   fs.writeFileSync(bmPath, JSON.stringify(model), "utf8");
 }
 
-// Extract text from PDFs
+// Extract text from PDFs (text layer only)
 async function extractFromPdf(pdfPath) {
   const dataBuffer = fs.readFileSync(pdfPath);
   const parsed = await pdfParse(dataBuffer).catch(() => null);
@@ -82,7 +82,8 @@ async function extractFromPdf(pdfPath) {
 
 // Chunk text into ~800 char passages
 function chunkTextToPassages(text, sourceId, maxLen = 800) {
-  // naive whitespace chunker. works ok for English; Chinese becomes long runs
+  // whitespace splitting strategy:
+  // ok for English, Chinese becomes long runs, but still indexable
   const clean = text.replace(/\s+/g, " ").trim();
   const words = clean.split(" ");
   const out = [];
@@ -106,8 +107,8 @@ function chunkTextToPassages(text, sourceId, maxLen = 800) {
 
 // --------------- Rebuild BM25 on boot ---------------
 //
-// This ensures bm25.json always matches index.json after (re)deploy.
-// Prevents stale bm25 from older code versions.
+// On service start, ensure bm25.json is in sync with index.json.
+// This prevents "stale bm25" issues after code changes or redeploy.
 
 (function forceBm25RebuildOnBoot() {
   try {
@@ -138,7 +139,7 @@ app.get("/api/health", (req, res) => {
 
 // ------------------ Multer config ------------------
 //
-// We accept docFile/file/document field names from the admin page, just in case.
+// We accept docFile/file/document as possible field names.
 
 const multiFieldUpload = multer({
   storage: multer.diskStorage({
@@ -159,10 +160,10 @@ const multiFieldUpload = multer({
 // ------------------ Upload Guideline ------------------
 //
 // POST /api/upload
-// multipart/form-data: title, langs, docFile/file/document
-// Supports: pdf (text layer only for now), docx, png/jpg/jpeg/tif/tiff (OCR).
-//
-// After extraction, we chunk -> append to index.json -> rebuild BM25.
+// multipart/form-data: title, langs, file (pdf/docx/png/jpg/tif/...)
+// - PDF: we read embedded text only (no OCR inside PDF pages of pure images)
+// - DOCX: we parse text
+// - Images: we run OCR using Tesseract via ocrImage()
 
 app.post("/api/upload", (req, res) => {
   multiFieldUpload(req, res, async (err) => {
@@ -202,8 +203,10 @@ app.post("/api/upload", (req, res) => {
       let textContent = "";
 
       if (ext === ".pdf") {
+        // text layer from PDF
         textContent = (await extractFromPdf(storedPath)) || "";
       } else if (ext === ".docx") {
+        // parse DOCX
         textContent = (await extractDocx(storedPath)) || "";
       } else if (
         ext === ".png" ||
@@ -212,6 +215,7 @@ app.post("/api/upload", (req, res) => {
         ext === ".tif" ||
         ext === ".tiff"
       ) {
+        // OCR on images
         textContent = (await ocrImage(storedPath, langs)) || "";
       } else {
         return res.status(400).json({
@@ -225,11 +229,11 @@ app.post("/api/upload", (req, res) => {
         return res.status(400).json({
           error:
             "Could not extract text from this file (empty result). " +
-            "If this is a scanned PDF, PDF OCR for images inside PDF is not implemented yet.",
+            "If this is a scanned PDF, PDF OCR for embedded images is not implemented yet.",
         });
       }
 
-      // Chunk and index
+      // Chunk and update index
       const passages = chunkTextToPassages(textContent, sourceId);
 
       const idx = loadIndex();
@@ -265,7 +269,7 @@ app.post("/api/upload", (req, res) => {
 // ------------------ List Guidelines ------------------
 //
 // GET /api/sources
-// Returns idx.docs for admin dashboard
+// Used in the admin dashboard to show which guidelines are loaded
 
 app.get("/api/sources", (req, res) => {
   try {
@@ -281,7 +285,7 @@ app.get("/api/sources", (req, res) => {
 //
 // DELETE /api/source/:id
 // Requires header x-admin-secret == ADMIN_SECRET
-// Removes doc & all its chunks, then rebuilds BM25.
+// Removes that doc + its chunks, then rebuilds BM25
 
 app.delete("/api/source/:id", (req, res) => {
   try {
@@ -321,9 +325,8 @@ app.delete("/api/source/:id", (req, res) => {
 // POST /api/llm-proxy
 // Body: { prompt, max_tokens?, temperature? }
 //
-// This is an OpenAI-compatible call.
-// We send {model, messages:[{role:"user", content: prompt}], ...} to LLM_API_URL.
-// We hide LLM_API_KEY from the browser/frontend.
+// This hides your LLM API key from the browser. It forwards the chat
+// completion request to the provider defined by environment variables.
 
 app.post("/api/llm-proxy", async (req, res) => {
   try {
@@ -389,12 +392,11 @@ app.post("/api/llm-proxy", async (req, res) => {
 // POST /api/ask
 // Body: { query: "..." }
 //
-// Steps:
-//   1. Retrieve top 5 BM25 passages
-//   2. If bestScore < 0.2 -> fallback
-//   3. Build strict prompt
-//   4. Send to /api/llm-proxy
-//   5. Return LLM's answer or fallback
+// Flow:
+// 1. Retrieve top 5 matching passages from BM25
+// 2. Build a strict evidence-based prompt
+// 3. Send that to /api/llm-proxy
+// 4. Extract the model answer (safely, with logging)
 
 app.post("/api/ask", async (req, res) => {
   const fallback =
@@ -422,7 +424,7 @@ app.post("/api/ask", async (req, res) => {
       return res.json({ answer: fallback });
     }
 
-    // Retrieve top hits
+    // Retrieve top 5 hits
     const hits = searchTop(bm25Model, query, 5);
 
     if (!hits.length) {
@@ -430,25 +432,26 @@ app.post("/api/ask", async (req, res) => {
       return res.json({ answer: fallback });
     }
 
-    // Debug
+    // Debug hits
     console.log("[ASK] Query:", query);
     console.log("[ASK] Top hits (score, sourceId, snippet):");
     hits.forEach((h, i) => {
       console.log(
         `   #${i + 1} score=${h.score?.toFixed?.(3)} src=${h.sourceId} text=${(h.text || "")
-          .slice(0, 120)
+          .slice(0, 160)
           .replace(/\s+/g, " ")}...`
       );
     });
 
-    // threshold
+    // Safety threshold — currently irrelevant because your scores are huge (>6),
+    // but we keep it in place to avoid hallucinations for totally unrelated queries:
     const bestScore = hits[0].score ?? 0;
     if (bestScore < 0.2) {
       console.log("[ASK] Best score below threshold:", bestScore);
       return res.json({ answer: fallback });
     }
 
-    // Build evidence
+    // Build evidence text
     const evidenceBlock = hits
       .map((hit, i) => {
         const parentDoc = idx.docs.find((d) => d.sourceId === hit.sourceId);
@@ -458,7 +461,7 @@ app.post("/api/ask", async (req, res) => {
       })
       .join("\n\n");
 
-    // Prompt for LLM
+    // Build the strict prompt
     const prompt = `
 You are a colorectal cancer clinical information assistant.
 You MUST follow these rules:
@@ -476,7 +479,7 @@ ${evidenceBlock}
 Provide the best possible answer in clear, clinically responsible language.
 `.trim();
 
-    // Call our generic LLM proxy
+    // Call our local LLM proxy (which in turn calls Groq/OpenAI/etc)
     const proxyURL = `${req.protocol}://${req.get("host")}/api/llm-proxy`;
 
     const llmResp = await fetch(proxyURL, {
@@ -496,13 +499,46 @@ Provide the best possible answer in clear, clinically responsible language.
 
     const llmData = await llmResp.json().catch(() => null);
 
-    // Try OpenAI ChatCompletion shape:
-    const finalAnswer =
-      llmData?.choices?.[0]?.message?.content?.trim?.() ||
-      llmData?.text?.trim?.() ||
-      fallback;
+    // Log raw LLM output for debugging model format
+    console.log("[ASK] LLM raw:", JSON.stringify(llmData).slice(0, 2000));
 
-    return res.json({ answer: finalAnswer });
+    // Try to extract an answer from several common response shapes
+    let answerText = null;
+
+    // Typical OpenAI / Groq chat shape:
+    if (
+      llmData &&
+      Array.isArray(llmData.choices) &&
+      llmData.choices.length > 0
+    ) {
+      if (llmData.choices[0].message?.content) {
+        answerText = llmData.choices[0].message.content;
+      } else if (llmData.choices[0].text) {
+        // sometimes providers return .text
+        answerText = llmData.choices[0].text;
+      }
+    }
+
+    // Other fallback keys some providers use:
+    if (!answerText && llmData?.output) {
+      answerText = llmData.output;
+    }
+    if (!answerText && llmData?.answer) {
+      answerText = llmData.answer;
+    }
+
+    // Clean up
+    if (answerText && typeof answerText === "string") {
+      answerText = answerText.trim();
+    }
+
+    // If we *still* couldn't extract anything, use fallback.
+    if (!answerText) {
+      console.warn("[ASK] Unable to extract LLM answer, using fallback.");
+      return res.json({ answer: fallback });
+    }
+
+    return res.json({ answer: answerText });
   } catch (err) {
     console.error("[ASK] Unhandled error:", err);
     return res.status(500).json({ answer: fallback });
