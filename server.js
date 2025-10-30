@@ -20,7 +20,8 @@ import { fileURLToPath } from 'url';
 import { extractDocx } from './parsers/extractDocx.js';
 import { ocrImage } from './parsers/ocrImage.js';
 import { buildIndex, searchTop } from './search/bm25.js';
-import { franc } from 'franc-min';
+import francPkg from 'franc-min';
+const franc = francPkg.franc || francPkg;
 
 // --------------------------------------------------
 // __dirname emulation for ES modules
